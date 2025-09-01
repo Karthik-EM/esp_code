@@ -16,9 +16,11 @@ const int ledPin = 2;
 const int buttonPin = 4;//calibration
 const int wifi_blue = 19;
 const int motion_yellow = 18;
+const int wificonfig_button = 5;
 
 float refAccelX, refAccelY, refAccelZ;
 bool lastButtonState = HIGH;
+bool lastwifibuttonstate = HIGH;
 
 // status variables
 int motion_status = 0;
@@ -28,7 +30,7 @@ int last_tilt = 0;
 
 
 // Flask server URL (default)
-String serverUrl = " http://192.168.43.192:5000/update";
+String serverUrl = "http://192.168.43.192:5000/update";
 
 void calibrate() {
   sensors_event_t a, g, temp;
@@ -46,7 +48,9 @@ void setup() {
   pinMode(rcwlPin, INPUT);
   pinMode(ledPin, OUTPUT);
   pinMode(wifi_blue, OUTPUT);
+  pinMode(motion_yellow, OUTPUT);
   pinMode(buttonPin, INPUT_PULLUP);
+  pinMode(wificonfig_button, INPUT_PULLUP);
 
   // --- MPU6050 setup ---
   if (!mpu.begin()) {
@@ -75,8 +79,6 @@ void setup() {
   {
     Serial.println("connected");
     digitalWrite(wifi_blue,1);
-    delay(500);
-    digitalWrite(wifi_blue,0);
   }
 
   // Read server URL from portal
@@ -88,6 +90,38 @@ void setup() {
 }
 
 void loop() {
+    //wifi calling duringruntime
+  bool wifibuttonstate = digitalRead(wificonfig_button);
+  if (wifibuttonstate == LOW && lastwifibuttonstate == HIGH) // button pressed
+  { 
+      delay(200);  // debounce delay (prevent double trigger)
+
+      digitalWrite(wifi_blue, LOW);
+      Serial.println("Starting Wi-Fi config portal...");
+
+      WiFiManager wifiManager;
+      WiFiManagerParameter custom_server_url("server", "Flask Server URL", serverUrl.c_str(), 100);
+      wifiManager.addParameter(&custom_server_url);
+
+      // Blocking call: stays here until user connects Wi-Fi
+      wifiManager.startConfigPortal("ESP32-Setup");
+
+      serverUrl = custom_server_url.getValue(); // read new server URL
+
+      if (WiFi.status() == WL_CONNECTED) {
+          digitalWrite(wifi_blue, HIGH);
+          Serial.println("✅ Successfully connected to Wi-Fi!");
+          Serial.print("ESP32 IP: ");
+          Serial.println(WiFi.localIP());
+          ESP.restart();
+      } 
+      else {
+          Serial.println("❌ Failed to connect to Wi-Fi. Restarting...");
+          ESP.restart();
+      }
+  }
+
+  lastwifibuttonstate = wifibuttonstate;
   int motionDetected1 = digitalRead(pirPin);
   int motionDetected2 = digitalRead(rcwlPin);
 
@@ -130,7 +164,7 @@ void loop() {
   // Send data only if status changed
   if (last_motion != motion_status || last_tilt != tilt_status) {
     if (WiFi.status() == WL_CONNECTED) {
-      digitalWrite(wifi_blue,0);
+      digitalWrite(wifi_blue,1);
       HTTPClient http;
       http.begin(serverUrl);
       http.addHeader("Content-Type", "application/json");
@@ -148,7 +182,8 @@ void loop() {
       http.end();
     } else {
       Serial.println("WiFi disconnected");
-      digitalWrite(wifi_blue,1);
+      digitalWrite(wifi_blue,0);
+      WiFi.reconnect();
     }
   }
 
