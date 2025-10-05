@@ -1,0 +1,150 @@
+#include <driver/i2s.h>
+
+#define I2S_WS 15
+#define I2S_SD 32
+#define I2S_SCK 14
+#define I2S_PORT I2S_NUM_0
+#define I2S_SAMPLE_RATE 16000
+#define I2S_SAMPLE_BITS 16
+#define I2S_READ_LEN (16 * 1024)
+#define RECORD_TIME 5  // seconds
+#define I2S_CHANNEL_NUM 1
+#define HEADER_SIZE 44
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("READY");  // Only one text message
+  i2sInit();
+  recordAndSend();
+}
+
+void loop() {}
+
+void i2sInit() {
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = I2S_SAMPLE_RATE,
+    .bits_per_sample = (i2s_bits_per_sample_t)I2S_SAMPLE_BITS,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
+    .intr_alloc_flags = 0,
+    .dma_buf_count = 8,
+    .dma_buf_len = 1024,
+    .use_apll = false
+  };
+  i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+  const i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_SCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = -1,
+    .data_in_num = I2S_SD
+  };
+  i2s_set_pin(I2S_PORT, &pin_config);
+}
+
+void recordAndSend() {
+  int totalBytes = I2S_SAMPLE_RATE * (I2S_SAMPLE_BITS / 8) * RECORD_TIME;
+  sendWavHeader(totalBytes);
+
+  char *i2s_read_buff = (char *)calloc(I2S_READ_LEN, sizeof(char));
+  size_t bytes_read;
+  int sentBytes = 0;
+
+  while (sentBytes < totalBytes) {
+    i2s_read(I2S_PORT, (void *)i2s_read_buff, I2S_READ_LEN, &bytes_read, portMAX_DELAY);
+    Serial.write((uint8_t *)i2s_read_buff, bytes_read);
+    sentBytes += bytes_read;
+  }
+
+  free(i2s_read_buff);
+}
+
+void sendWavHeader(int dataSize) {
+  byte header[HEADER_SIZE];
+  int fileSize = dataSize + HEADER_SIZE - 8;
+
+  // RIFF chunk
+  header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
+  header[4] = fileSize & 0xFF;
+  header[5] = (fileSize >> 8) & 0xFF;
+  header[6] = (fileSize >> 16) & 0xFF;
+  header[7] = (fileSize >> 24) & 0xFF;
+  header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
+
+  // fmt chunk
+  header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
+  header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0;
+  header[20] = 1; header[21] = 0;
+  header[22] = 1; header[23] = 0;
+  header[24] = I2S_SAMPLE_RATE & 0xFF;
+  header[25] = (I2S_SAMPLE_RATE >> 8) & 0xFF;
+  header[26] = (I2S_SAMPLE_RATE >> 16) & 0xFF;
+  header[27] = (I2S_SAMPLE_RATE >> 24) & 0xFF;
+  int byteRate = I2S_SAMPLE_RATE * I2S_CHANNEL_NUM * I2S_SAMPLE_BITS / 8;
+  header[28] = byteRate & 0xFF;
+  header[29] = (byteRate >> 8) & 0xFF;
+  header[30] = (byteRate >> 16) & 0xFF;
+  header[31] = (byteRate >> 24) & 0xFF;
+  int blockAlign = I2S_CHANNEL_NUM * I2S_SAMPLE_BITS / 8;
+  header[32] = blockAlign & 0xFF;
+  header[33] = (blockAlign >> 8) & 0xFF;
+  header[34] = I2S_SAMPLE_BITS & 0xFF;
+  header[35] = (I2S_SAMPLE_BITS >> 8) & 0xFF;
+  header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
+  header[40] = dataSize & 0xFF;
+  header[41] = (dataSize >> 8) & 0xFF;
+  header[42] = (dataSize >> 16) & 0xFF;
+  header[43] = (dataSize >> 24) & 0xFF;
+
+  Serial.write(header, HEADER_SIZE);
+}
+
+
+/////////python
+import serial
+import time
+import struct
+
+PORT = "COM3"   # Change this to your port
+BAUD = 115200
+OUTPUT_FILE = "recording.wav"
+
+print("Waiting for ESP32...")
+ser = serial.Serial(PORT, BAUD, timeout=1)
+
+# Wait until ESP32 sends "READY"
+while True:
+    line = ser.readline().decode(errors="ignore").strip()
+    if line == "READY":
+        print("ESP32 ready, waiting for WAV data...")
+        break
+
+# Read WAV header (44 bytes)
+header = ser.read(44)
+if len(header) < 44:
+    print("Failed to read header.")
+    exit()
+
+# Parse sample rate and size from header for safety
+data_size = struct.unpack('<I', header[40:44])[0]
+print(f"Expecting {data_size} bytes of audio data...")
+
+# Read exact number of bytes
+audio_data = bytearray()
+while len(audio_data) < data_size:
+    chunk = ser.read(1024)
+    if not chunk:
+        break
+    audio_data.extend(chunk)
+
+# Save complete file
+with open(OUTPUT_FILE, "wb") as f:
+    f.write(header)
+    f.write(audio_data)
+
+ser.close()
+print(f"Saved {len(audio_data)} bytes of audio to {OUTPUT_FILE}")
+
+
+
