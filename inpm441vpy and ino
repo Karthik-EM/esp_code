@@ -1,36 +1,192 @@
 #include <driver/i2s.h>
+#include <arduinoFFT.h>
 
+// ================= I2S CONFIG =================
 #define I2S_WS 15
-#define I2S_SD 32
+#define I2S_SD 33
 #define I2S_SCK 14
 #define I2S_PORT I2S_NUM_0
+
 #define I2S_SAMPLE_RATE 16000
-#define I2S_SAMPLE_BITS 16
-#define I2S_READ_LEN (16 * 1024)
-#define RECORD_TIME 5  // seconds
-#define I2S_CHANNEL_NUM 1
-#define HEADER_SIZE 44
+#define SAMPLES_PER_CHUNK 256
+#define I2S_SAMPLE_BITS 32
+
+#ifndef LED_BUILTIN
+#define LED_BUILTIN 2
+#endif
+
+// =================================================================
+// ====== FINAL TUNING (WIDENED FOR REVERB) ======
+// =================================================================
+
+// 1. TRIGGER
+#define SOFTWARE_GAIN_FACTOR 1.0    
+#define TRIGGER_AMP_THRESHOLD 1000  
+
+// 2. DURATION GATE (Widened)
+// Your logs showed 26-27 chunks.
+// We are increasing the Max to 35 to accommodate room echo.
+#define MIN_CONSECUTIVE_CHUNKS 8    // Lowered slightly to catch fast snaps
+#define MAX_CONSECUTIVE_CHUNKS 35   // Increased from 25 to 35
+#define MAX_EVENT_DURATION 600      // Increased timeout to allow longer analysis
+
+// 3. SPECTRAL RATIO 
+#define MIN_HIGH_TO_LOW_RATIO 3.0
+
+// 4. ZERO CROSSING RATE 
+#define MIN_ZCR_COUNT 75
+
+// 5. BASS CEILING 
+#define MAX_LOW_ENERGY_THRESHOLD 42000
+// =================================================================
+
+enum State { IDLE, TRIGGERED };
+State currentState = IDLE;
+
+unsigned long eventStartTime = 0;
+int consecutiveLoudChunks = 0;
+int16_t peak_amplitude_of_event = 0;
+
+// FFT Objects
+ArduinoFFT<double> FFT = ArduinoFFT<double>();
+double vReal[SAMPLES_PER_CHUNK];
+double vImag[SAMPLES_PER_CHUNK];
+int16_t peak_chunk_buffer[SAMPLES_PER_CHUNK];
+
+// LED Timer
+unsigned long ledOnTime = 0;
+const int ledOnDuration = 5000;
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-  Serial.println("READY");  // Only one text message
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
   i2sInit();
-  recordAndSend();
+  Serial.println("Gunshot Detector (Wide Window) Ready");
+  Serial.println("------------------------------------");
 }
 
-void loop() {}
+void loop() {
+  int32_t samples32[SAMPLES_PER_CHUNK];
+  int16_t samples[SAMPLES_PER_CHUNK];
+  size_t bytes_read;
+
+  i2s_read(I2S_PORT, samples32, sizeof(samples32), &bytes_read, portMAX_DELAY);
+  if (bytes_read == 0) return;
+
+  int16_t current_peak = 0;
+
+  // Pre-Process
+  for (int i = 0; i < SAMPLES_PER_CHUNK; i++) {
+    int32_t s = samples32[i] >> 16; 
+    s *= SOFTWARE_GAIN_FACTOR;
+    if (s > 32767) s = 32767;
+    if (s < -32768) s = -32768;
+    samples[i] = (int16_t)s;
+
+    if (abs(samples[i]) > current_peak) current_peak = abs(samples[i]);
+  }
+
+  switch (currentState) {
+    case IDLE:
+      if (current_peak > TRIGGER_AMP_THRESHOLD) {
+        currentState = TRIGGERED;
+        eventStartTime = millis();
+        consecutiveLoudChunks = 1;
+        peak_amplitude_of_event = current_peak;
+        memcpy(peak_chunk_buffer, samples, sizeof(samples));
+        Serial.printf("Triggered (Amp: %d)... ", current_peak);
+      }
+      break;
+
+    case TRIGGERED:
+      if (current_peak > (TRIGGER_AMP_THRESHOLD / 2)) {
+        consecutiveLoudChunks++;
+        if (current_peak > peak_amplitude_of_event) {
+          peak_amplitude_of_event = current_peak;
+          memcpy(peak_chunk_buffer, samples, sizeof(samples));
+        }
+      }
+
+      if (millis() - eventStartTime > MAX_EVENT_DURATION) {
+        
+        // --- FILTER 1: DURATION ---
+        if (consecutiveLoudChunks >= MIN_CONSECUTIVE_CHUNKS && consecutiveLoudChunks <= MAX_CONSECUTIVE_CHUNKS) {
+          
+          // FFT Processing
+          for (int i = 0; i < SAMPLES_PER_CHUNK; i++) {
+            vReal[i] = peak_chunk_buffer[i];
+            vImag[i] = 0;
+          }
+          FFT.windowing(vReal, SAMPLES_PER_CHUNK, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+          FFT.compute(vReal, vImag, SAMPLES_PER_CHUNK, FFT_FORWARD);
+          FFT.complexToMagnitude(vReal, vImag, SAMPLES_PER_CHUNK);
+
+          double lowEnergy = 0;
+          double highEnergy = 0;
+
+          // Calculate Bands
+          for (int i = 2; i < SAMPLES_PER_CHUNK / 2; i++) {
+            double freq = i * 62.5;
+            if (freq < 1000) lowEnergy += vReal[i];
+            if (freq > 2500) highEnergy += vReal[i];
+          }
+          if (lowEnergy == 0) lowEnergy = 1; 
+
+          double ratio = highEnergy / lowEnergy;
+          
+          // Calculate ZCR
+          int peak_zcr = 0;
+          int16_t p = 0;
+          for(int k=0; k<SAMPLES_PER_CHUNK; k++){
+             if ((peak_chunk_buffer[k] > 0 && p <= 0) || (peak_chunk_buffer[k] < 0 && p >= 0)) peak_zcr++;
+             p = peak_chunk_buffer[k];
+          }
+
+          Serial.printf("Done. Dur:%d | Ratio:%.2f | ZCR:%d\n", consecutiveLoudChunks, ratio, peak_zcr);
+
+          // --- FILTERS 2, 3, 4 ---
+          bool passRatio = (ratio >= MIN_HIGH_TO_LOW_RATIO);
+          bool passZCR = (peak_zcr >= MIN_ZCR_COUNT);
+          bool passBass = (lowEnergy < MAX_LOW_ENERGY_THRESHOLD);
+
+          if (passRatio && passZCR && passBass) {
+            digitalWrite(LED_BUILTIN, HIGH);
+            ledOnTime = millis();
+            Serial.println(">>> GUNSHOT CONFIRMED <<<");
+          } else {
+             Serial.print("-> REJECTED: ");
+             if (!passRatio) Serial.print("Bad Ratio. ");
+             if (!passZCR)   Serial.print("Low ZCR. ");
+             if (!passBass)  Serial.print("Too Much Bass. ");
+             Serial.println();
+          }
+
+        } else {
+          Serial.printf("Done. REJECTED: Duration (%d) too short/long.\n", consecutiveLoudChunks);
+        }
+        
+        currentState = IDLE;
+      }
+      break;
+  }
+
+  if (ledOnTime > 0 && millis() - ledOnTime > ledOnDuration) {
+    digitalWrite(LED_BUILTIN, LOW);
+    ledOnTime = 0;
+  }
+}
 
 void i2sInit() {
   i2s_config_t i2s_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = I2S_SAMPLE_RATE,
-    .bits_per_sample = (i2s_bits_per_sample_t)I2S_SAMPLE_BITS,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = (i2s_comm_format_t)(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = 0,
     .dma_buf_count = 8,
-    .dma_buf_len = 1024,
+    .dma_buf_len = SAMPLES_PER_CHUNK,
     .use_apll = false
   };
   i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
@@ -42,109 +198,3 @@ void i2sInit() {
   };
   i2s_set_pin(I2S_PORT, &pin_config);
 }
-
-void recordAndSend() {
-  int totalBytes = I2S_SAMPLE_RATE * (I2S_SAMPLE_BITS / 8) * RECORD_TIME;
-  sendWavHeader(totalBytes);
-
-  char *i2s_read_buff = (char *)calloc(I2S_READ_LEN, sizeof(char));
-  size_t bytes_read;
-  int sentBytes = 0;
-
-  while (sentBytes < totalBytes) {
-    i2s_read(I2S_PORT, (void *)i2s_read_buff, I2S_READ_LEN, &bytes_read, portMAX_DELAY);
-    Serial.write((uint8_t *)i2s_read_buff, bytes_read);
-    sentBytes += bytes_read;
-  }
-
-  free(i2s_read_buff);
-}
-
-void sendWavHeader(int dataSize) {
-  byte header[HEADER_SIZE];
-  int fileSize = dataSize + HEADER_SIZE - 8;
-
-  // RIFF chunk
-  header[0] = 'R'; header[1] = 'I'; header[2] = 'F'; header[3] = 'F';
-  header[4] = fileSize & 0xFF;
-  header[5] = (fileSize >> 8) & 0xFF;
-  header[6] = (fileSize >> 16) & 0xFF;
-  header[7] = (fileSize >> 24) & 0xFF;
-  header[8] = 'W'; header[9] = 'A'; header[10] = 'V'; header[11] = 'E';
-
-  // fmt chunk
-  header[12] = 'f'; header[13] = 'm'; header[14] = 't'; header[15] = ' ';
-  header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0;
-  header[20] = 1; header[21] = 0;
-  header[22] = 1; header[23] = 0;
-  header[24] = I2S_SAMPLE_RATE & 0xFF;
-  header[25] = (I2S_SAMPLE_RATE >> 8) & 0xFF;
-  header[26] = (I2S_SAMPLE_RATE >> 16) & 0xFF;
-  header[27] = (I2S_SAMPLE_RATE >> 24) & 0xFF;
-  int byteRate = I2S_SAMPLE_RATE * I2S_CHANNEL_NUM * I2S_SAMPLE_BITS / 8;
-  header[28] = byteRate & 0xFF;
-  header[29] = (byteRate >> 8) & 0xFF;
-  header[30] = (byteRate >> 16) & 0xFF;
-  header[31] = (byteRate >> 24) & 0xFF;
-  int blockAlign = I2S_CHANNEL_NUM * I2S_SAMPLE_BITS / 8;
-  header[32] = blockAlign & 0xFF;
-  header[33] = (blockAlign >> 8) & 0xFF;
-  header[34] = I2S_SAMPLE_BITS & 0xFF;
-  header[35] = (I2S_SAMPLE_BITS >> 8) & 0xFF;
-  header[36] = 'd'; header[37] = 'a'; header[38] = 't'; header[39] = 'a';
-  header[40] = dataSize & 0xFF;
-  header[41] = (dataSize >> 8) & 0xFF;
-  header[42] = (dataSize >> 16) & 0xFF;
-  header[43] = (dataSize >> 24) & 0xFF;
-
-  Serial.write(header, HEADER_SIZE);
-}
-
-
-/////////python
-import serial
-import time
-import struct
-
-PORT = "COM3"   # Change this to your port
-BAUD = 115200
-OUTPUT_FILE = "recording.wav"
-
-print("Waiting for ESP32...")
-ser = serial.Serial(PORT, BAUD, timeout=1)
-
-# Wait until ESP32 sends "READY"
-while True:
-    line = ser.readline().decode(errors="ignore").strip()
-    if line == "READY":
-        print("ESP32 ready, waiting for WAV data...")
-        break
-
-# Read WAV header (44 bytes)
-header = ser.read(44)
-if len(header) < 44:
-    print("Failed to read header.")
-    exit()
-
-# Parse sample rate and size from header for safety
-data_size = struct.unpack('<I', header[40:44])[0]
-print(f"Expecting {data_size} bytes of audio data...")
-
-# Read exact number of bytes
-audio_data = bytearray()
-while len(audio_data) < data_size:
-    chunk = ser.read(1024)
-    if not chunk:
-        break
-    audio_data.extend(chunk)
-
-# Save complete file
-with open(OUTPUT_FILE, "wb") as f:
-    f.write(header)
-    f.write(audio_data)
-
-ser.close()
-print(f"Saved {len(audio_data)} bytes of audio to {OUTPUT_FILE}")
-
-
-
