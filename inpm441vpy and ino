@@ -16,36 +16,35 @@
 #endif
 
 // =================================================================
-// ====== FINAL TUNING (WIDENED FOR REVERB) ======
+// ====== ADAPTIVE TUNING (THE "TWO-STAGE" FILTER) ======
 // =================================================================
 
 // 1. TRIGGER
-#define SOFTWARE_GAIN_FACTOR 1.0    
+#define SOFTWARE_GAIN_FACTOR 0.8    
 #define TRIGGER_AMP_THRESHOLD 1000  
 
-// 2. DURATION GATE (Widened)
-// Your logs showed 26-27 chunks.
-// We are increasing the Max to 35 to accommodate room echo.
-#define MIN_CONSECUTIVE_CHUNKS 8    // Lowered slightly to catch fast snaps
-#define MAX_CONSECUTIVE_CHUNKS 35   // Increased from 25 to 35
-#define MAX_EVENT_DURATION 600      // Increased timeout to allow longer analysis
+// 2. DURATION
+// We widen the window to catch your 26-chunk shots.
+#define MIN_CONSECUTIVE_CHUNKS 8    
+#define MAX_CONSECUTIVE_CHUNKS 28   // Increased to 28 to catch the 26-chunk shot
 
-// 3. SPECTRAL RATIO 
-#define MIN_HIGH_TO_LOW_RATIO 3.0
+#define MAX_EVENT_DURATION 600      
 
-// 4. ZERO CROSSING RATE 
-#define MIN_ZCR_COUNT 75
+// 3. STANDARD THRESHOLDS (For Short/Quiet Shots)
+#define RATIO_STANDARD 3.0
+#define ZCR_STANDARD 75
+
+// 4. STRICT THRESHOLDS (For Long Loud Shots - Anti-Thunder)
+// If duration > 20, the sound MUST be this sharp to pass.
+// Thunder was Ratio ~11.0 / ZCR ~100.
+// Gunshots were Ratio ~16.0 / ZCR ~120.
+#define RATIO_STRICT 13.0
+#define ZCR_STRICT 110
 
 // 5. BASS CEILING 
-#define MAX_LOW_ENERGY_THRESHOLD 42000
+#define MAX_LOW_ENERGY_THRESHOLD 60000
+
 // =================================================================
-
-enum State { IDLE, TRIGGERED };
-State currentState = IDLE;
-
-unsigned long eventStartTime = 0;
-int consecutiveLoudChunks = 0;
-int16_t peak_amplitude_of_event = 0;
 
 // FFT Objects
 ArduinoFFT<double> FFT = ArduinoFFT<double>();
@@ -57,124 +56,173 @@ int16_t peak_chunk_buffer[SAMPLES_PER_CHUNK];
 unsigned long ledOnTime = 0;
 const int ledOnDuration = 5000;
 
+// Task Handle
+TaskHandle_t AudioTaskHandle;
+
+// =================================================================
+// ====== CORE 0 TASK ======
+// =================================================================
+void AudioProcessingTask(void * parameter) {
+  
+  enum State { IDLE, TRIGGERED };
+  State currentState = IDLE;
+  unsigned long eventStartTime = 0;
+  int consecutiveLoudChunks = 0;
+  int16_t peak_amplitude_of_event = 0;
+
+  int32_t samples32[SAMPLES_PER_CHUNK];
+  int16_t samples[SAMPLES_PER_CHUNK];
+  size_t bytes_read;
+
+  for(;;) {
+    i2s_read(I2S_PORT, samples32, sizeof(samples32), &bytes_read, portMAX_DELAY);
+    
+    if (bytes_read > 0) {
+      int16_t current_peak = 0;
+
+      for (int i = 0; i < SAMPLES_PER_CHUNK; i++) {
+        int32_t s = samples32[i] >> 16; 
+        s *= SOFTWARE_GAIN_FACTOR;
+        if (s > 32767) s = 32767;
+        if (s < -32768) s = -32768;
+        samples[i] = (int16_t)s;
+
+        if (abs(samples[i]) > current_peak) current_peak = abs(samples[i]);
+      }
+
+      switch (currentState) {
+        case IDLE:
+          if (current_peak > TRIGGER_AMP_THRESHOLD) {
+            currentState = TRIGGERED;
+            eventStartTime = millis();
+            consecutiveLoudChunks = 1;
+            peak_amplitude_of_event = current_peak;
+            memcpy(peak_chunk_buffer, samples, sizeof(samples));
+            Serial.printf("Triggered (Amp: %d)... ", current_peak);
+          }
+          break;
+
+        case TRIGGERED:
+          if (current_peak > (TRIGGER_AMP_THRESHOLD / 2)) {
+            consecutiveLoudChunks++;
+            if (current_peak > peak_amplitude_of_event) {
+              peak_amplitude_of_event = current_peak;
+              memcpy(peak_chunk_buffer, samples, sizeof(samples));
+            }
+          }
+
+          if (millis() - eventStartTime > MAX_EVENT_DURATION) {
+            
+            // --- FILTER 1: DURATION (Widened to 28) ---
+            if (consecutiveLoudChunks >= MIN_CONSECUTIVE_CHUNKS && consecutiveLoudChunks <= MAX_CONSECUTIVE_CHUNKS) {
+              
+              // FFT Processing
+              for (int i = 0; i < SAMPLES_PER_CHUNK; i++) {
+                vReal[i] = peak_chunk_buffer[i];
+                vImag[i] = 0;
+              }
+              FFT.windowing(vReal, SAMPLES_PER_CHUNK, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
+              FFT.compute(vReal, vImag, SAMPLES_PER_CHUNK, FFT_FORWARD);
+              FFT.complexToMagnitude(vReal, vImag, SAMPLES_PER_CHUNK);
+
+              double lowEnergy = 0;
+              double highEnergy = 0;
+
+              for (int i = 2; i < SAMPLES_PER_CHUNK / 2; i++) {
+                double freq = i * 62.5;
+                if (freq < 1000) lowEnergy += vReal[i];
+                if (freq > 2500) highEnergy += vReal[i];
+              }
+              if (lowEnergy == 0) lowEnergy = 1; 
+
+              double ratio = highEnergy / lowEnergy;
+              
+              int peak_zcr = 0;
+              int16_t p = 0;
+              for(int k=0; k<SAMPLES_PER_CHUNK; k++){
+                 if ((peak_chunk_buffer[k] > 0 && p <= 0) || (peak_chunk_buffer[k] < 0 && p >= 0)) peak_zcr++;
+                 p = peak_chunk_buffer[k];
+              }
+
+              Serial.printf("Done. Dur:%d | Ratio:%.2f | ZCR:%d ", consecutiveLoudChunks, ratio, peak_zcr);
+
+              // ==========================================
+              // ====== ADAPTIVE LOGIC ======
+              // ==========================================
+              
+              bool isGunshot = false;
+              bool passBass = (lowEnergy < MAX_LOW_ENERGY_THRESHOLD);
+
+              // MODE A: SHORT EVENT (< 20 chunks)
+              // If it's short, it's likely a distant gunshot. Be gentle.
+              if (consecutiveLoudChunks <= 20) {
+                 if (ratio > RATIO_STANDARD && peak_zcr > ZCR_STANDARD && passBass) {
+                    isGunshot = true;
+                    Serial.print("[Standard Pass]");
+                 }
+              }
+              
+              // MODE B: LONG EVENT (20 - 28 chunks)
+              // If it's long, it MIGHT be Thunder. Be STRICT.
+              // It must be exceptionally "Bright" (High Ratio) or "Rough" (High ZCR) to pass.
+              else {
+                 if ((ratio > RATIO_STRICT || peak_zcr > ZCR_STRICT) && passBass) {
+                    isGunshot = true;
+                    Serial.print("[Strict Pass]");
+                 } else {
+                    Serial.print("[Strict Fail: Likely Thunder]");
+                 }
+              }
+
+              // Final Decision
+              if (isGunshot) {
+                digitalWrite(LED_BUILTIN, HIGH);
+                ledOnTime = millis();
+                Serial.println(" -> >>> GUNSHOT CONFIRMED <<<");
+              } else {
+                 Serial.println(" -> REJECTED");
+              }
+
+            } else {
+              Serial.printf("Done. REJECTED: Duration (%d) out of bounds.\n", consecutiveLoudChunks);
+            }
+            
+            currentState = IDLE;
+          }
+          break;
+      }
+
+      if (ledOnTime > 0 && millis() - ledOnTime > ledOnDuration) {
+        digitalWrite(LED_BUILTIN, LOW);
+        ledOnTime = 0;
+      }
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
   i2sInit();
-  Serial.println("Gunshot Detector (Wide Window) Ready");
-  Serial.println("------------------------------------");
+
+  Serial.println("System Initializing...");
+
+  xTaskCreatePinnedToCore(
+    AudioProcessingTask,   
+    "AudioTask",           
+    10000,                 
+    NULL,                  
+    1,                     
+    &AudioTaskHandle,      
+    0                      
+  );
+  
+  Serial.println("Adaptive Gunshot Detector Launched on Core 0");
 }
 
 void loop() {
-  int32_t samples32[SAMPLES_PER_CHUNK];
-  int16_t samples[SAMPLES_PER_CHUNK];
-  size_t bytes_read;
-
-  i2s_read(I2S_PORT, samples32, sizeof(samples32), &bytes_read, portMAX_DELAY);
-  if (bytes_read == 0) return;
-
-  int16_t current_peak = 0;
-
-  // Pre-Process
-  for (int i = 0; i < SAMPLES_PER_CHUNK; i++) {
-    int32_t s = samples32[i] >> 16; 
-    s *= SOFTWARE_GAIN_FACTOR;
-    if (s > 32767) s = 32767;
-    if (s < -32768) s = -32768;
-    samples[i] = (int16_t)s;
-
-    if (abs(samples[i]) > current_peak) current_peak = abs(samples[i]);
-  }
-
-  switch (currentState) {
-    case IDLE:
-      if (current_peak > TRIGGER_AMP_THRESHOLD) {
-        currentState = TRIGGERED;
-        eventStartTime = millis();
-        consecutiveLoudChunks = 1;
-        peak_amplitude_of_event = current_peak;
-        memcpy(peak_chunk_buffer, samples, sizeof(samples));
-        Serial.printf("Triggered (Amp: %d)... ", current_peak);
-      }
-      break;
-
-    case TRIGGERED:
-      if (current_peak > (TRIGGER_AMP_THRESHOLD / 2)) {
-        consecutiveLoudChunks++;
-        if (current_peak > peak_amplitude_of_event) {
-          peak_amplitude_of_event = current_peak;
-          memcpy(peak_chunk_buffer, samples, sizeof(samples));
-        }
-      }
-
-      if (millis() - eventStartTime > MAX_EVENT_DURATION) {
-        
-        // --- FILTER 1: DURATION ---
-        if (consecutiveLoudChunks >= MIN_CONSECUTIVE_CHUNKS && consecutiveLoudChunks <= MAX_CONSECUTIVE_CHUNKS) {
-          
-          // FFT Processing
-          for (int i = 0; i < SAMPLES_PER_CHUNK; i++) {
-            vReal[i] = peak_chunk_buffer[i];
-            vImag[i] = 0;
-          }
-          FFT.windowing(vReal, SAMPLES_PER_CHUNK, FFT_WIN_TYP_HAMMING, FFT_FORWARD);
-          FFT.compute(vReal, vImag, SAMPLES_PER_CHUNK, FFT_FORWARD);
-          FFT.complexToMagnitude(vReal, vImag, SAMPLES_PER_CHUNK);
-
-          double lowEnergy = 0;
-          double highEnergy = 0;
-
-          // Calculate Bands
-          for (int i = 2; i < SAMPLES_PER_CHUNK / 2; i++) {
-            double freq = i * 62.5;
-            if (freq < 1000) lowEnergy += vReal[i];
-            if (freq > 2500) highEnergy += vReal[i];
-          }
-          if (lowEnergy == 0) lowEnergy = 1; 
-
-          double ratio = highEnergy / lowEnergy;
-          
-          // Calculate ZCR
-          int peak_zcr = 0;
-          int16_t p = 0;
-          for(int k=0; k<SAMPLES_PER_CHUNK; k++){
-             if ((peak_chunk_buffer[k] > 0 && p <= 0) || (peak_chunk_buffer[k] < 0 && p >= 0)) peak_zcr++;
-             p = peak_chunk_buffer[k];
-          }
-
-          Serial.printf("Done. Dur:%d | Ratio:%.2f | ZCR:%d\n", consecutiveLoudChunks, ratio, peak_zcr);
-
-          // --- FILTERS 2, 3, 4 ---
-          bool passRatio = (ratio >= MIN_HIGH_TO_LOW_RATIO);
-          bool passZCR = (peak_zcr >= MIN_ZCR_COUNT);
-          bool passBass = (lowEnergy < MAX_LOW_ENERGY_THRESHOLD);
-
-          if (passRatio && passZCR && passBass) {
-            digitalWrite(LED_BUILTIN, HIGH);
-            ledOnTime = millis();
-            Serial.println(">>> GUNSHOT CONFIRMED <<<");
-          } else {
-             Serial.print("-> REJECTED: ");
-             if (!passRatio) Serial.print("Bad Ratio. ");
-             if (!passZCR)   Serial.print("Low ZCR. ");
-             if (!passBass)  Serial.print("Too Much Bass. ");
-             Serial.println();
-          }
-
-        } else {
-          Serial.printf("Done. REJECTED: Duration (%d) too short/long.\n", consecutiveLoudChunks);
-        }
-        
-        currentState = IDLE;
-      }
-      break;
-  }
-
-  if (ledOnTime > 0 && millis() - ledOnTime > ledOnDuration) {
-    digitalWrite(LED_BUILTIN, LOW);
-    ledOnTime = 0;
-  }
+  delay(1000); 
 }
 
 void i2sInit() {
