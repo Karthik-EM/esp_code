@@ -12,7 +12,7 @@ Preferences preferences;  // <--- ADDED THIS (This fixes your error)
 
 // Pin definitions
 const int pirPin = 27;
-const int rcwlPin = 26;
+const int rcwlPin = 17;
 
 const int ledPin = 2;        
 const int wifi_on = 19;
