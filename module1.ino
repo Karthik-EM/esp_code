@@ -1,4 +1,4 @@
-//v1(added gunshot)
+//esp status sending added
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include <Wire.h>
@@ -9,18 +9,17 @@
 #include <Preferences.h>
 #include <driver/i2s.h>
 #include <arduinoFFT.h>
-
+//orginal
 // ==========================================
 // PIN DEFINITIONS
 // ==========================================
-// Sensors & UI
 const int pirPin = 27;
 const int rcwlPin = 17;
-const int ledPin = 2;          // Shared Status LED
+const int ledPin = 2;          
 const int wifi_on = 19;
 const int wifi_off = 32;
 const int motion_yellow = 18;
-const int buttonPin = 4;       // Calibration button
+const int buttonPin = 4;       
 const int wificonfig_button = 5;
 
 // I2S Microphone
@@ -28,6 +27,12 @@ const int wificonfig_button = 5;
 #define I2S_SD 33
 #define I2S_SCK 14
 #define I2S_PORT I2S_NUM_0
+
+// ==========================================
+// SYSTEM & HEARTBEAT CONFIG (NEW)
+// ==========================================
+#define HEARTBEAT_INTERVAL 5000   // 5 seconds
+static unsigned long lastHeartbeat = 0;
 
 // ==========================================
 // AUDIO & FFT CONFIG
@@ -64,7 +69,7 @@ int16_t peak_chunk_buffer[SAMPLES_PER_CHUNK];
 float refAccelX, refAccelY, refAccelZ;
 float refMag;
 float last_angle = 0.0;
-float current_angle = 0.0; // Shared for payload
+float current_angle = 0.0;
 int motion_status = 0;
 int last_motion = 0;
 int tilt_status = 0;
@@ -95,9 +100,11 @@ TaskHandle_t AudioTaskHandle;
 void sendData(bool isGunshotEvent);
 void calibrate();
 void i2sInit();
+void sendHeartbeat();   // NEW
+void handleHeartbeat(); // NEW
 
 // ==========================================
-// CORE 0: AUDIO PROCESSING TASK
+// CORE 0: AUDIO PROCESSING TASK (Untouched)
 // ==========================================
 void AudioProcessingTask(void * parameter) {
   enum State { IDLE, TRIGGERED };
@@ -133,7 +140,6 @@ void AudioProcessingTask(void * parameter) {
             consecutiveLoudChunks = 1;
             peak_amplitude_of_event = current_peak;
             memcpy(peak_chunk_buffer, samples, sizeof(samples));
-            // --- RESTORED LOG ---
             Serial.printf("Triggered (Amp: %d)... ", current_peak);
           }
           break;
@@ -149,7 +155,6 @@ void AudioProcessingTask(void * parameter) {
 
           if (millis() - eventStartTime > MAX_EVENT_DURATION) {
             
-            // --- FILTER 1: DURATION ---
             if (consecutiveLoudChunks >= MIN_CONSECUTIVE_CHUNKS && consecutiveLoudChunks <= MAX_CONSECUTIVE_CHUNKS) {
               
               // 1. FFT
@@ -165,7 +170,7 @@ void AudioProcessingTask(void * parameter) {
               double highEnergy = 0;
 
               for (int i = 2; i < SAMPLES_PER_CHUNK / 2; i++) {
-                double freq = i * 62.5; // 16000 / 256 = 62.5Hz bin size
+                double freq = i * 62.5; 
                 if (freq < 1000) lowEnergy += vReal[i];
                 if (freq > 2500) highEnergy += vReal[i];
               }
@@ -181,7 +186,6 @@ void AudioProcessingTask(void * parameter) {
                  p = peak_chunk_buffer[k];
               }
 
-              // --- RESTORED LOG ---
               Serial.printf("Done. Dur:%d | Ratio:%.2f | ZCR:%d ", consecutiveLoudChunks, ratio, peak_zcr);
 
               // 3. Logic
@@ -204,17 +208,14 @@ void AudioProcessingTask(void * parameter) {
 
               if (isGunshot) {
                 Serial.println(" -> >>> GUNSHOT CONFIRMED <<<");
-                
-                // Flag Core 1 to send data
                 gunshotRatio = ratio;
                 gunshotZCR = peak_zcr;
                 gunshotDetected = true; 
-                digitalWrite(ledPin, HIGH); // Flash LED immediately
+                digitalWrite(ledPin, HIGH); 
               } else {
                 Serial.println(" -> REJECTED");
               }
             } else {
-               // --- RESTORED LOG ---
                Serial.printf("Done. REJECTED: Duration (%d) out of bounds.\n", consecutiveLoudChunks);
             }
             currentState = IDLE;
@@ -226,7 +227,7 @@ void AudioProcessingTask(void * parameter) {
 }
 
 // ==========================================
-// HELPER: Send Data to Server
+// HELPER: Send Data (Events)
 // ==========================================
 void sendData(bool isGunshotEvent) {
   if (WiFi.status() == WL_CONNECTED) {
@@ -238,22 +239,18 @@ void sendData(bool isGunshotEvent) {
      http.addHeader("Content-Type", "application/json");
 
      char payload[128];
-     
-     // 1 indicates Gunshot Event, 0 indicates Motion/Tilt Event
      int gsFlag = isGunshotEvent ? 1 : 0;
      double r = isGunshotEvent ? gunshotRatio : 0.0;
      int z = isGunshotEvent ? gunshotZCR : 0;
 
-     // Payload Format
      snprintf(payload, sizeof(payload), 
               "{\"motion\":%d,\"tilt\":%.2f,\"gunshot\":%d,\"ratio\":%.2f,\"zcr\":%d}", 
               motion_status, current_angle, gsFlag, r, z);
      
      int code = http.POST(payload);
      
-     // --- RESTORED LOGGING ---
      if (code > 0) {
-        Serial.println("Sent to server");
+        Serial.println("Sent Event to server");
         Serial.println(http.getString());
      } else {
         Serial.print("HTTP Error: ");
@@ -265,7 +262,56 @@ void sendData(bool isGunshotEvent) {
      WiFi.reconnect();
   }
   
-  if(isGunshotEvent) digitalWrite(ledPin, LOW); // Turn off LED after sending
+  if(isGunshotEvent) digitalWrite(ledPin, LOW); 
+}
+
+// ==========================================
+// HELPER: Send Heartbeat (NEW)
+// ==========================================
+void sendHeartbeat() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    http.begin(serverUrl);
+    http.addHeader("Content-Type", "application/json");
+
+    uint32_t freeHeap = ESP.getFreeHeap();
+    uint32_t minHeap  = ESP.getMinFreeHeap();
+    int8_t rssi       = WiFi.RSSI();
+    
+    // NOTE: temperatureRead() returns internal ESP32 die temp, not room temp.
+    // It is useful for overheating detection.
+    float temperature = temperatureRead(); 
+
+    char payload[180];
+    snprintf(payload, sizeof(payload),
+        "{"
+        "\"alive\":1,"
+        "\"uptime\":%lu,"
+        "\"free_heap\":%u,"
+        "\"min_heap\":%u,"
+        "\"temp\":%.1f,"
+        "\"rssi\":%d"
+        "}",
+        millis(), freeHeap, minHeap, temperature, rssi
+    );
+
+    int code = http.POST(payload);
+    if(code > 0) {
+       // Optional: Uncomment if you want to see heartbeat logs
+       // Serial.printf("Heartbeat Sent. RSSI: %d | Heap: %u\n", rssi, freeHeap);
+       http.getString(); // Consume response to clear buffer
+    }
+    http.end();
+}
+
+void handleHeartbeat() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    if (millis() - lastHeartbeat >= HEARTBEAT_INTERVAL) {
+        lastHeartbeat = millis();
+        sendHeartbeat();
+    }
 }
 
 // ==========================================
@@ -295,12 +341,15 @@ void calibrate() {
   refMag = sqrt(refAccelX*refAccelX + refAccelY*refAccelY + refAccelZ*refAccelZ);
 
   Serial.println("New reference saved!");
-  Serial.print("Ref X: "); Serial.println(refAccelX);
-  Serial.print("Ref Y: "); Serial.println(refAccelY);
-  Serial.print("Ref Z: "); Serial.println(refAccelZ);
-  
-  digitalWrite(wifi_on, 0);
-  digitalWrite(wifi_off, 0);
+// Restore LED state based on WiFi status
+if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(wifi_on, HIGH);
+    digitalWrite(wifi_off, LOW);
+} else {
+    digitalWrite(wifi_on, LOW);
+    digitalWrite(wifi_off, HIGH);
+}
+
 }
 
 // ==========================================
@@ -361,10 +410,13 @@ void setup() {
 
   if (!wifiManager.autoConnect("ESP32-Security")) {
     Serial.println("Failed to connect. Restarting...");
+    digitalWrite(wifi_off, 1);
+    digitalWrite(wifi_on, 0);
     ESP.restart();
   } else {
     Serial.println("Connected to WiFi");
     digitalWrite(wifi_on, 1);
+     digitalWrite(wifi_off, 0);
   }
 
   String newUrl = custom_server_url.getValue();
@@ -378,14 +430,17 @@ void setup() {
 // LOOP (Core 1)
 // ==========================================
 void loop() {
-  // 1. Check for Gunshot Event (High Priority)
+  
+  // ---- 1. SYSTEM HEARTBEAT (NEW) ----
+  handleHeartbeat();
+
+  // ---- 2. GUNSHOT EVENT (High Priority) ----
   if (gunshotDetected) {
-      sendData(true); // Send Gunshot Data
-      gunshotDetected = false; // Reset flag
+      sendData(true); 
+      gunshotDetected = false; 
   }
 
-  // 2. Fast Loop (Buttons)
-  // WiFi Reset Button
+  // ---- 3. FAST LOOP (Buttons) ----
   int readingWifi = digitalRead(wificonfig_button);
   if (readingWifi == LOW && lastWifiButtonState == HIGH) {
       delay(50); 
@@ -399,7 +454,6 @@ void loop() {
         serverUrl.toCharArray(serverUrlBuffer, 100);
         WiFiManagerParameter custom_server_url("server", "Flask Server URL", serverUrlBuffer, 100);
         wifiManager.addParameter(&custom_server_url);
-        
         wifiManager.startConfigPortal("ESP32-Security");
         
         String newUrl = custom_server_url.getValue();
@@ -410,7 +464,6 @@ void loop() {
   }
   lastWifiButtonState = readingWifi;
 
-  // Calibration Button
   int readingCal = digitalRead(buttonPin);
   if (readingCal == LOW && lastButtonState == HIGH) {
      delay(50);
@@ -418,20 +471,17 @@ void loop() {
   }
   lastButtonState = readingCal;
 
-  // 3. Slow Loop (Sensors 1Hz)
+  // ---- 4. SLOW LOOP (Sensors 1Hz) ----
   unsigned long currentMillis = millis();
   if (currentMillis - previousMillis >= interval) {
     previousMillis = currentMillis; 
 
-    // Read Motion
     int motion1 = digitalRead(pirPin);
     int motion2 = digitalRead(rcwlPin);
     
-    // --- RESTORED LOGGING ---
     Serial.print("pir: "); Serial.println(motion1);
     Serial.print("rcwl: "); Serial.println(motion2);
     
-    // Read MPU
     sensors_event_t a, g, temp;
     mpu.getEvent(&a, &g, &temp);
 
@@ -449,10 +499,8 @@ void loop() {
       current_angle = acos(cosine) * 180.0 / PI;
     }
 
-    // --- RESTORED LOGGING ---
     Serial.print("Tilt Angle: "); Serial.println(current_angle);
 
-    // Tilt Logic
     tilt_status = 0;
     if(last_angle > 30 && current_angle < 30) tilt_status = 1;
     else if(current_angle > 30 && abs(current_angle - last_angle) > 2.0) tilt_status = 1;
@@ -463,9 +511,8 @@ void loop() {
 
     digitalWrite(motion_yellow, motion_status);
 
-    // Send Motion/Tilt Data
     if (last_motion != motion_status || tilt_status) {
-       sendData(false); // Send Motion Data (gunshot = 0)
+       sendData(false); 
     }
   } 
 }
