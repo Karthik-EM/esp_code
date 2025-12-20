@@ -1,6 +1,6 @@
-//esp status sending added
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include <WiFiClientSecure.h>
 #include <Wire.h>
 #include <math.h>
 #include <WiFi.h>
@@ -9,6 +9,7 @@
 #include <Preferences.h>
 #include <driver/i2s.h>
 #include <arduinoFFT.h>
+
 //orginal
 // ==========================================
 // PIN DEFINITIONS
@@ -44,13 +45,13 @@ static unsigned long lastHeartbeat = 0;
 
 // Gunshot Detection Thresholds
 #define MIN_CONSECUTIVE_CHUNKS 8
-#define MAX_CONSECUTIVE_CHUNKS 28
+#define MAX_CONSECUTIVE_CHUNKS 35
 #define MAX_EVENT_DURATION 600
 
 #define RATIO_STANDARD 3.0
 #define ZCR_STANDARD 75
-#define RATIO_STRICT 13.0
-#define ZCR_STRICT 110
+#define RATIO_STRICT 9.0
+#define ZCR_STRICT 100
 #define MAX_LOW_ENERGY_THRESHOLD 60000
 
 // ==========================================
@@ -192,7 +193,7 @@ void AudioProcessingTask(void * parameter) {
               bool isGunshot = false;
               bool passBass = (lowEnergy < MAX_LOW_ENERGY_THRESHOLD);
 
-              if (consecutiveLoudChunks <= 20) {
+              if (consecutiveLoudChunks <= 22) {
                  if (ratio > RATIO_STANDARD && peak_zcr > ZCR_STANDARD && passBass) {
                     isGunshot = true;
                     Serial.print("[Standard Pass]");
@@ -234,8 +235,11 @@ void sendData(bool isGunshotEvent) {
      digitalWrite(wifi_on, HIGH);
      digitalWrite(wifi_off, 0);
 
-     HTTPClient http;
-     http.begin(serverUrl);
+WiFiClientSecure client;
+client.setInsecure();
+
+HTTPClient http;
+http.begin(client, serverUrl);
      http.addHeader("Content-Type", "application/json");
 
      char payload[128];
@@ -271,8 +275,11 @@ void sendData(bool isGunshotEvent) {
 void sendHeartbeat() {
     if (WiFi.status() != WL_CONNECTED) return;
 
-    HTTPClient http;
-    http.begin(serverUrl);
+WiFiClientSecure client;
+client.setInsecure();
+
+HTTPClient http;
+http.begin(client, serverUrl);
     http.addHeader("Content-Type", "application/json");
 
     uint32_t freeHeap = ESP.getFreeHeap();
@@ -399,7 +406,7 @@ void setup() {
 
   // --- Preferences & WiFi ---
   preferences.begin("my-app", false);
-  String storedUrl = preferences.getString("server_url", "http://10.229.135.218:5000/update");
+  String storedUrl = preferences.getString("server_url", "https://render-flask-server-hc64.onrender.com/update");
   storedUrl.toCharArray(serverUrlBuffer, 100);
   serverUrl = storedUrl;
   Serial.print("Loaded Server URL: "); Serial.println(serverUrl);
