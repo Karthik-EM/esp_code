@@ -1,6 +1,6 @@
 # ESP32 IoT Smart Security System
 
-A real-time IoT-based smart security system built on ESP32 that detects motion, tampering (tilt), and gunshot-like acoustic events using digital signal processing (DSP).  
+A real-time IoT-based smart security system built on ESP32 that detects motion, tilt, and gunshot-like acoustic events using digital signal processing (DSP).  
 The system sends instant alerts and periodic health heartbeats to a cloud server over secure HTTPS.
 
 ## Project Overview
