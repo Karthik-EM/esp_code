@@ -1,4 +1,4 @@
-# IoT Acoustic Event & Intrusion Detection System
+# Wireless Anti-Poaching & Wildlife Telemetry Unit
 
 ##Overview
 This project is a sophisticated embedded system prototype designed to detect environmental anomalies and security threats at the "Edge." Built on the ESP32 platform, it utilizes multi-modal sensing to detect specific audio signatures (like loud transient events), human motion, and physical device tampering.
