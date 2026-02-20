@@ -20,14 +20,13 @@
 // =================================================================
 
 #define SOFTWARE_GAIN_FACTOR 0.8    
-#define TRIGGER_AMP_THRESHOLD 1000  
-
+#define TRIGGER_AMP_THRESHOLD 2500   // Raised from 1000
 #define MIN_CONSECUTIVE_CHUNKS 8    
 #define MAX_CONSECUTIVE_CHUNKS 35  
 #define MAX_EVENT_DURATION 600      
 
-#define RATIO_STANDARD 3.0
-#define ZCR_STANDARD 75
+#define RATIO_STANDARD 2.0
+#define ZCR_STANDARD 50
 #define RATIO_STRICT 13.0
 #define ZCR_STRICT 100
 #define MAX_LOW_ENERGY_THRESHOLD 60000
