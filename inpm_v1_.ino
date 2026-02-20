@@ -19,44 +19,30 @@
 // ====== ADAPTIVE TUNING (THE "TWO-STAGE" FILTER) ======
 // =================================================================
 
-// 1. TRIGGER
 #define SOFTWARE_GAIN_FACTOR 0.8    
 #define TRIGGER_AMP_THRESHOLD 1000  
 
-// 2. DURATION
-// We widen the window to catch your 26-chunk shots.
 #define MIN_CONSECUTIVE_CHUNKS 8    
-#define MAX_CONSECUTIVE_CHUNKS 28   // Increased to 28 to catch the 26-chunk shot
-
+#define MAX_CONSECUTIVE_CHUNKS 35  
 #define MAX_EVENT_DURATION 600      
 
-// 3. STANDARD THRESHOLDS (For Short/Quiet Shots)
 #define RATIO_STANDARD 3.0
 #define ZCR_STANDARD 75
-
-// 4. STRICT THRESHOLDS (For Long Loud Shots - Anti-Thunder)
-// If duration > 20, the sound MUST be this sharp to pass.
-// Thunder was Ratio ~11.0 / ZCR ~100.
-// Gunshots were Ratio ~16.0 / ZCR ~120.
 #define RATIO_STRICT 13.0
-#define ZCR_STRICT 110
-
-// 5. BASS CEILING 
+#define ZCR_STRICT 100
 #define MAX_LOW_ENERGY_THRESHOLD 60000
 
 // =================================================================
 
-// FFT Objects
 ArduinoFFT<double> FFT = ArduinoFFT<double>();
 double vReal[SAMPLES_PER_CHUNK];
 double vImag[SAMPLES_PER_CHUNK];
+
+// Buffer to hold the data for FFT analysis
 int16_t peak_chunk_buffer[SAMPLES_PER_CHUNK];
 
-// LED Timer
 unsigned long ledOnTime = 0;
 const int ledOnDuration = 5000;
-
-// Task Handle
 TaskHandle_t AudioTaskHandle;
 
 // =================================================================
@@ -70,25 +56,50 @@ void AudioProcessingTask(void * parameter) {
   int consecutiveLoudChunks = 0;
   int16_t peak_amplitude_of_event = 0;
 
-  int32_t samples32[SAMPLES_PER_CHUNK];
-  int16_t samples[SAMPLES_PER_CHUNK];
+  // We double the raw read buffer to hold both Left and Right samples
+  int32_t samples32[SAMPLES_PER_CHUNK * 2]; 
+  
+  // Separate arrays for de-interleaved stereo data
+  int16_t samplesLeft[SAMPLES_PER_CHUNK];
+  int16_t samplesRight[SAMPLES_PER_CHUNK];
+  
   size_t bytes_read;
 
   for(;;) {
     i2s_read(I2S_PORT, samples32, sizeof(samples32), &bytes_read, portMAX_DELAY);
     
     if (bytes_read > 0) {
-      int16_t current_peak = 0;
+      int16_t current_peak_L = 0;
+      int16_t current_peak_R = 0;
+      int sampleIdx = 0;
 
-      for (int i = 0; i < SAMPLES_PER_CHUNK; i++) {
-        int32_t s = samples32[i] >> 16; 
-        s *= SOFTWARE_GAIN_FACTOR;
-        if (s > 32767) s = 32767;
-        if (s < -32768) s = -32768;
-        samples[i] = (int16_t)s;
+      // De-interleave the 32-bit data into two 16-bit arrays
+      for (int i = 0; i < (SAMPLES_PER_CHUNK * 2); i += 2) {
+        
+        // --- Process Left Channel ---
+        int32_t sL = samples32[i] >> 16; 
+        sL *= SOFTWARE_GAIN_FACTOR;
+        if (sL > 32767) sL = 32767;
+        if (sL < -32768) sL = -32768;
+        samplesLeft[sampleIdx] = (int16_t)sL;
+        if (abs(samplesLeft[sampleIdx]) > current_peak_L) current_peak_L = abs(samplesLeft[sampleIdx]);
 
-        if (abs(samples[i]) > current_peak) current_peak = abs(samples[i]);
+        // --- Process Right Channel ---
+        int32_t sR = samples32[i+1] >> 16; 
+        sR *= SOFTWARE_GAIN_FACTOR;
+        if (sR > 32767) sR = 32767;
+        if (sR < -32768) sR = -32768;
+        samplesRight[sampleIdx] = (int16_t)sR;
+        if (abs(samplesRight[sampleIdx]) > current_peak_R) current_peak_R = abs(samplesRight[sampleIdx]);
+
+        sampleIdx++;
       }
+
+      // Determine the overall loudest peak between both microphones
+      int16_t current_peak = max(current_peak_L, current_peak_R);
+
+      // Determine which channel had the loudest audio to save for FFT analysis
+      int16_t* loudest_channel_buffer = (current_peak_L > current_peak_R) ? samplesLeft : samplesRight;
 
       switch (currentState) {
         case IDLE:
@@ -97,7 +108,9 @@ void AudioProcessingTask(void * parameter) {
             eventStartTime = millis();
             consecutiveLoudChunks = 1;
             peak_amplitude_of_event = current_peak;
-            memcpy(peak_chunk_buffer, samples, sizeof(samples));
+            
+            // Save the audio from the loudest microphone for FFT
+            memcpy(peak_chunk_buffer, loudest_channel_buffer, sizeof(samplesLeft));
             Serial.printf("Triggered (Amp: %d)... ", current_peak);
           }
           break;
@@ -107,16 +120,14 @@ void AudioProcessingTask(void * parameter) {
             consecutiveLoudChunks++;
             if (current_peak > peak_amplitude_of_event) {
               peak_amplitude_of_event = current_peak;
-              memcpy(peak_chunk_buffer, samples, sizeof(samples));
+              memcpy(peak_chunk_buffer, loudest_channel_buffer, sizeof(samplesLeft));
             }
           }
 
           if (millis() - eventStartTime > MAX_EVENT_DURATION) {
-            
-            // --- FILTER 1: DURATION (Widened to 28) ---
             if (consecutiveLoudChunks >= MIN_CONSECUTIVE_CHUNKS && consecutiveLoudChunks <= MAX_CONSECUTIVE_CHUNKS) {
               
-              // FFT Processing
+              // FFT Processing (Running on the loudest channel's data)
               for (int i = 0; i < SAMPLES_PER_CHUNK; i++) {
                 vReal[i] = peak_chunk_buffer[i];
                 vImag[i] = 0;
@@ -146,26 +157,15 @@ void AudioProcessingTask(void * parameter) {
 
               Serial.printf("Done. Dur:%d | Ratio:%.2f | ZCR:%d ", consecutiveLoudChunks, ratio, peak_zcr);
 
-              // ==========================================
-              // ====== ADAPTIVE LOGIC ======
-              // ==========================================
-              
               bool isGunshot = false;
               bool passBass = (lowEnergy < MAX_LOW_ENERGY_THRESHOLD);
 
-              // MODE A: SHORT EVENT (< 20 chunks)
-              // If it's short, it's likely a distant gunshot. Be gentle.
-              if (consecutiveLoudChunks <= 20) {
+              if (consecutiveLoudChunks <= 25) {
                  if (ratio > RATIO_STANDARD && peak_zcr > ZCR_STANDARD && passBass) {
                     isGunshot = true;
                     Serial.print("[Standard Pass]");
                  }
-              }
-              
-              // MODE B: LONG EVENT (20 - 28 chunks)
-              // If it's long, it MIGHT be Thunder. Be STRICT.
-              // It must be exceptionally "Bright" (High Ratio) or "Rough" (High ZCR) to pass.
-              else {
+              } else {
                  if ((ratio > RATIO_STRICT || peak_zcr > ZCR_STRICT) && passBass) {
                     isGunshot = true;
                     Serial.print("[Strict Pass]");
@@ -174,11 +174,10 @@ void AudioProcessingTask(void * parameter) {
                  }
               }
 
-              // Final Decision
               if (isGunshot) {
                 digitalWrite(LED_BUILTIN, HIGH);
                 ledOnTime = millis();
-                Serial.println(" -> >>> GUNSHOT CONFIRMED <<<");
+                Serial.println(" -> >>> STEREO GUNSHOT CONFIRMED <<<");
               } else {
                  Serial.println(" -> REJECTED");
               }
@@ -218,7 +217,7 @@ void setup() {
     0                      
   );
   
-  Serial.println("Adaptive Gunshot Detector Launched on Core 0");
+  Serial.println("Stereo Adaptive Gunshot Detector Launched on Core 0");
 }
 
 void loop() {
@@ -230,11 +229,13 @@ void i2sInit() {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
     .sample_rate = I2S_SAMPLE_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
-    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    // FIX: Read both the high and low states of the WS clock
+    .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = 0,
     .dma_buf_count = 8,
-    .dma_buf_len = SAMPLES_PER_CHUNK,
+    // Keep this the same; we doubled the read buffer size instead
+    .dma_buf_len = SAMPLES_PER_CHUNK, 
     .use_apll = false
   };
   i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
